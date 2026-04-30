@@ -1,0 +1,5 @@
+runBaseline=true
+runImproved=true
+writeResults=true
+maxSteps=1000000
+timeoutMs=1000000

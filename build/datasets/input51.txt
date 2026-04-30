@@ -1,0 +1,1 @@
+(forall x ((B(x) and (E(x) and (R2(x) and G(x))))) -> ((forall x (B(x)) and forall x (E(x))) and (forall x (R2(x)) and forall x (G(x)))))
