@@ -1,0 +1,573 @@
+/**
+ * @file BaselingProver.cpp
+ */
+
+#include "BaselineProver.hpp"
+#include "Sequent.hpp"
+#include <chrono>
+#include <vector>
+#include <set>
+#include <iostream>
+
+static std::string freshConstant() {
+    static int counter = 0;
+    ++counter;
+    return "c" + std::to_string(counter);
+}
+
+static std::string makeInstantiationKey(
+    const Formula* formula,
+    const std::string& term,
+    const std::string& side
+) {
+    return side + "::" + formula->toString() + "::" + term;
+}
+
+static bool proveSequent(
+    const Sequent& sequent,
+    long long& steps,
+    long long& branches,
+    std::set<std::string> usedInstantiations,
+    std::vector<std::string>& trace,
+    std::set<std::string>& visited)
+{
+    ++steps;
+    if (steps > 200) {
+        trace.push_back("Abort: step limit reached");
+        return false;
+    }
+
+    std::string stateKey = sequent.toString();
+    if (visited.find(stateKey) != visited.end()) {
+        trace.push_back("Loop detected: repeated sequent state");
+        return false;
+    }
+    visited.insert(stateKey);
+
+    // Priority 1: id
+    if (sequent.isClosedById()) {
+        trace.push_back("Apply id: Branch Closes");
+        return true;
+    }
+
+    // =================================================
+    // Immediate closing rules (⊤R and ⊥L)
+    // =================================================
+
+    // ⊤R : Γ |- Δ, ⊤   → close
+    for (const Formula* f : sequent.getRight()) {
+        if (f != nullptr && f->getType() == FormulaType::True) {
+            trace.push_back("Apply ⊤R: Branch Closes");
+            return true;
+        }
+    }
+
+    // ⊥L : Γ, ⊥ |- Δ   → close
+    for (const Formula* f : sequent.getLeft()) {
+        if (f != nullptr && f->getType() == FormulaType::False) {
+            trace.push_back("Apply ⊥L: Branch Closes");
+            return true;
+        }
+    }
+
+    // =================================================
+    // Priority 2: non-branching rules
+    // =================================================
+
+    // ->R
+    for (std::size_t i = 0; i < sequent.getRight().size(); ++i) {
+        const Formula* formula = sequent.getRight()[i];
+
+        if (formula != nullptr && formula->getType() == FormulaType::Implies) {
+            const Formula* A = formula->getLeft();
+            const Formula* B = formula->getRight();
+
+            std::vector<const Formula*> newLeft = sequent.getLeft();
+            std::vector<const Formula*> newRight = sequent.getRight();
+
+            newLeft.push_back(A);
+            newRight.erase(newRight.begin() + static_cast<long long>(i));
+            newRight.push_back(B);
+
+            Sequent next = sequent;
+            next.setLeft(newLeft);
+            next.setRight(newRight);
+            trace.push_back("Apply ->R");
+
+            std::set<std::string> nextVisited = visited;
+            return proveSequent(next, steps, branches, usedInstantiations, trace, nextVisited);
+        }
+    }
+
+    // ∧L
+    for (std::size_t i = 0; i < sequent.getLeft().size(); ++i) {
+        const Formula* formula = sequent.getLeft()[i];
+
+        if (formula != nullptr && formula->getType() == FormulaType::And) {
+            const Formula* A = formula->getLeft();
+            const Formula* B = formula->getRight();
+
+            std::vector<const Formula*> newLeft = sequent.getLeft();
+            std::vector<const Formula*> newRight = sequent.getRight();
+
+            newLeft.erase(newLeft.begin() + static_cast<long long>(i));
+            newLeft.push_back(A);
+            newLeft.push_back(B);
+
+            Sequent next = sequent;
+            next.setLeft(newLeft);
+            next.setRight(newRight);
+            trace.push_back("Apply ∧L");
+
+            std::set<std::string> nextVisited = visited;
+            return proveSequent(next, steps, branches, usedInstantiations, trace, nextVisited);
+        }
+    }
+
+    // ∨R
+    for (std::size_t i = 0; i < sequent.getRight().size(); ++i) {
+        const Formula* formula = sequent.getRight()[i];
+
+        if (formula != nullptr && formula->getType() == FormulaType::Or) {
+            const Formula* A = formula->getLeft();
+            const Formula* B = formula->getRight();
+
+            {
+                std::vector<const Formula*> newLeft = sequent.getLeft();
+                std::vector<const Formula*> newRight = sequent.getRight();
+
+                newRight.erase(newRight.begin() + static_cast<long long>(i));
+                newRight.push_back(A);
+
+                Sequent next = sequent;
+                next.setLeft(newLeft);
+                next.setRight(newRight);
+
+                std::set<std::string> nextVisited = visited;
+                if (proveSequent(next, steps, branches, usedInstantiations, trace, nextVisited)) {
+                    trace.push_back("Apply ∨R: Left disjunct");
+                    return true;
+                }
+            }
+
+            {
+                std::vector<const Formula*> newLeft = sequent.getLeft();
+                std::vector<const Formula*> newRight = sequent.getRight();
+
+                newRight.erase(newRight.begin() + static_cast<long long>(i));
+                newRight.push_back(B);
+
+                Sequent next = sequent;
+                next.setLeft(newLeft);
+                next.setRight(newRight);
+
+                std::set<std::string> nextVisited = visited;
+                if (proveSequent(next, steps, branches, usedInstantiations, trace, nextVisited)) {
+                    trace.push_back("Apply ∨R: Right disjunct");
+                    return true;
+                }
+            }
+
+            break;
+        }
+    }
+
+    // ¬L
+    for (std::size_t i = 0; i < sequent.getLeft().size(); ++i) {
+        const Formula* formula = sequent.getLeft()[i];
+
+        if (formula != nullptr && formula->getType() == FormulaType::Not) {
+            const Formula* A = formula->getOperand();
+
+            std::vector<const Formula*> newLeft = sequent.getLeft();
+            std::vector<const Formula*> newRight = sequent.getRight();
+
+            newLeft.erase(newLeft.begin() + static_cast<long long>(i));
+            newRight.push_back(A);
+
+            Sequent next = sequent;
+            next.setLeft(newLeft);
+            next.setRight(newRight);
+            trace.push_back("Apply ¬L");
+
+            std::set<std::string> nextVisited = visited;
+            return proveSequent(next, steps, branches, usedInstantiations, trace, nextVisited);
+        }
+    }
+
+    // ¬R
+    for (std::size_t i = 0; i < sequent.getRight().size(); ++i) {
+        const Formula* formula = sequent.getRight()[i];
+
+        if (formula != nullptr && formula->getType() == FormulaType::Not) {
+            const Formula* A = formula->getOperand();
+
+            std::vector<const Formula*> newLeft = sequent.getLeft();
+            std::vector<const Formula*> newRight = sequent.getRight();
+
+            newRight.erase(newRight.begin() + static_cast<long long>(i));
+            newLeft.push_back(A);
+
+            Sequent next = sequent;
+            next.setLeft(newLeft);
+            next.setRight(newRight);
+            trace.push_back("Apply ¬R");
+
+            std::set<std::string> nextVisited = visited;
+            return proveSequent(next, steps, branches, usedInstantiations, trace, nextVisited);
+        }
+    }
+
+    // ∀R
+    for (std::size_t i = 0; i < sequent.getRight().size(); ++i) {
+        const Formula* formula = sequent.getRight()[i];
+
+        if (formula != nullptr && formula->getType() == FormulaType::Forall) {
+            const std::string* var = formula->getVariable();
+            const Formula* body = formula->getBody();
+
+            if (var != nullptr && body != nullptr) {
+                std::string c = freshConstant();
+
+                std::vector<const Formula*> newLeft = sequent.getLeft();
+                std::vector<const Formula*> newRight = sequent.getRight();
+                newRight.erase(newRight.begin() + static_cast<long long>(i));
+
+                Sequent next = sequent;
+                next.setLeft(newLeft);
+                next.setRight(newRight);
+                next.addOwnedRight(body->substitute(*var, c));
+                trace.push_back("Apply ∀R");
+
+                std::set<std::string> nextVisited = visited;
+                return proveSequent(next, steps, branches, usedInstantiations, trace, nextVisited);
+            }
+        }
+    }
+
+    // ∃L
+    for (std::size_t i = 0; i < sequent.getLeft().size(); ++i) {
+        const Formula* formula = sequent.getLeft()[i];
+
+        if (formula != nullptr && formula->getType() == FormulaType::Exists) {
+            const std::string* var = formula->getVariable();
+            const Formula* body = formula->getBody();
+
+            if (var != nullptr && body != nullptr) {
+                std::string c = freshConstant();
+
+                std::vector<const Formula*> newLeft = sequent.getLeft();
+                std::vector<const Formula*> newRight = sequent.getRight();
+                newLeft.erase(newLeft.begin() + static_cast<long long>(i));
+
+                Sequent next = sequent;
+                next.setLeft(newLeft);
+                next.setRight(newRight);
+                next.addOwnedLeft(body->substitute(*var, c));
+                trace.push_back("Apply ∃L");
+
+                std::set<std::string> nextVisited = visited;
+                return proveSequent(next, steps, branches, usedInstantiations, trace, nextVisited);
+            }
+        }
+    }
+
+    // =================================================
+    // Priority 3: branching rules
+    // =================================================
+
+    // ∧R
+    for (std::size_t i = 0; i < sequent.getRight().size(); ++i) {
+        const Formula* formula = sequent.getRight()[i];
+
+        if (formula != nullptr && formula->getType() == FormulaType::And) {
+            const Formula* A = formula->getLeft();
+            const Formula* B = formula->getRight();
+
+            std::vector<const Formula*> left1 = sequent.getLeft();
+            std::vector<const Formula*> right1 = sequent.getRight();
+            right1.erase(right1.begin() + static_cast<long long>(i));
+            right1.push_back(A);
+
+            std::vector<const Formula*> left2 = sequent.getLeft();
+            std::vector<const Formula*> right2 = sequent.getRight();
+            right2.erase(right2.begin() + static_cast<long long>(i));
+            right2.push_back(B);
+
+            branches += 2;
+
+            Sequent branch1(left1, right1);
+            Sequent branch2(left2, right2);
+
+            trace.push_back("Apply ∧R: Branching into two subgoals");
+
+            std::set<std::string> visited1 = visited;
+            std::set<std::string> visited2 = visited;
+
+            return proveSequent(branch1, steps, branches, usedInstantiations, trace, visited1)
+                && proveSequent(branch2, steps, branches, usedInstantiations, trace, visited2);
+        }
+    }
+
+    // ∨L
+    for (std::size_t i = 0; i < sequent.getLeft().size(); ++i) {
+        const Formula* formula = sequent.getLeft()[i];
+
+        if (formula != nullptr && formula->getType() == FormulaType::Or) {
+            const Formula* A = formula->getLeft();
+            const Formula* B = formula->getRight();
+
+            std::vector<const Formula*> left1 = sequent.getLeft();
+            std::vector<const Formula*> right1 = sequent.getRight();
+            left1.erase(left1.begin() + static_cast<long long>(i));
+            left1.push_back(A);
+
+            std::vector<const Formula*> left2 = sequent.getLeft();
+            std::vector<const Formula*> right2 = sequent.getRight();
+            left2.erase(left2.begin() + static_cast<long long>(i));
+            left2.push_back(B);
+
+            branches += 2;
+
+            Sequent branch1(left1, right1);
+            Sequent branch2(left2, right2);
+
+            trace.push_back("Apply ∨L: Branching into two subgoals");
+
+            std::set<std::string> visited1 = visited;
+            std::set<std::string> visited2 = visited;
+
+            return proveSequent(branch1, steps, branches, usedInstantiations, trace, visited1)
+                && proveSequent(branch2, steps, branches, usedInstantiations, trace, visited2);
+        }
+    }
+
+    // ->L
+    for (std::size_t i = 0; i < sequent.getLeft().size(); ++i) {
+        const Formula* formula = sequent.getLeft()[i];
+
+        if (formula != nullptr && formula->getType() == FormulaType::Implies) {
+            const Formula* A = formula->getLeft();
+            const Formula* B = formula->getRight();
+
+            std::vector<const Formula*> left1 = sequent.getLeft();
+            std::vector<const Formula*> right1 = sequent.getRight();
+            left1.erase(left1.begin() + static_cast<long long>(i));
+            right1.push_back(A);
+
+            std::vector<const Formula*> left2 = sequent.getLeft();
+            std::vector<const Formula*> right2 = sequent.getRight();
+            left2.erase(left2.begin() + static_cast<long long>(i));
+            left2.push_back(B);
+
+            branches += 2;
+
+            Sequent branch1(left1, right1);
+            Sequent branch2(left2, right2);
+
+            trace.push_back("Apply ->L: Branching into antecedent/consequent subgoals");
+
+            std::set<std::string> visited1 = visited;
+            std::set<std::string> visited2 = visited;
+
+            return proveSequent(branch1, steps, branches, usedInstantiations, trace, visited1)
+                && proveSequent(branch2, steps, branches, usedInstantiations, trace, visited2);
+        }
+    }
+
+    // =================================================
+    // Priority 4: ∀L / ∃R with existing unused term
+    // =================================================
+
+    {
+        std::vector<std::string> terms = sequent.getAllTerms();
+
+        for (std::size_t i = 0; i < sequent.getLeft().size(); ++i) {
+            const Formula* formula = sequent.getLeft()[i];
+
+            if (formula != nullptr && formula->getType() == FormulaType::Forall) {
+                const std::string* var = formula->getVariable();
+                const Formula* body = formula->getBody();
+
+                if (var != nullptr && body != nullptr) {
+                    for (const std::string& term : terms) {
+                        std::string key = makeInstantiationKey(formula, term, "forallL");
+                        if (usedInstantiations.find(key) != usedInstantiations.end()) {
+                            continue;
+                        }
+
+                        std::vector<const Formula*> newLeft = sequent.getLeft();
+                        newLeft.erase(newLeft.begin() + static_cast<long long>(i));
+                        std::vector<const Formula*> newRight = sequent.getRight();
+
+                        Sequent next = sequent;
+                        next.setLeft(newLeft);
+                        next.setRight(newRight);
+                        next.addOwnedLeft(body->substitute(*var, term));
+
+                        std::set<std::string> nextUsed = usedInstantiations;
+                        nextUsed.insert(key);
+
+                        trace.push_back("Apply ∀L - used term " + term);
+
+                        std::set<std::string> nextVisited = visited;
+                        if (proveSequent(next, steps, branches, nextUsed, trace, nextVisited)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        for (std::size_t i = 0; i < sequent.getRight().size(); ++i) {
+            const Formula* formula = sequent.getRight()[i];
+
+            if (formula != nullptr && formula->getType() == FormulaType::Exists) {
+                const std::string* var = formula->getVariable();
+                const Formula* body = formula->getBody();
+
+                if (var != nullptr && body != nullptr) {
+                    for (const std::string& term : terms) {
+                        std::string key = makeInstantiationKey(formula, term, "existsR");
+                        if (usedInstantiations.find(key) != usedInstantiations.end()) {
+                            continue;
+                        }
+
+                        std::vector<const Formula*> newLeft = sequent.getLeft();
+                        std::vector<const Formula*> newRight = sequent.getRight();
+                        newRight.erase(newRight.begin() + static_cast<long long>(i));
+
+                        Sequent next = sequent;
+                        next.setLeft(newLeft);
+                        next.setRight(newRight);
+                        next.addOwnedRight(body->substitute(*var, term));
+
+                        std::set<std::string> nextUsed = usedInstantiations;
+                        nextUsed.insert(key);
+
+                        trace.push_back("Apply ∃R - used term " + term);
+
+                        std::set<std::string> nextVisited = visited;
+                        if (proveSequent(next, steps, branches, nextUsed, trace, nextVisited)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // =================================================
+    // Priority 5: ∀L / ∃R with fresh term
+    // =================================================
+
+    for (std::size_t i = 0; i < sequent.getLeft().size(); ++i) {
+        const Formula* formula = sequent.getLeft()[i];
+
+        if (formula != nullptr && formula->getType() == FormulaType::Forall) {
+            const std::string* var = formula->getVariable();
+            const Formula* body = formula->getBody();
+
+            if (var != nullptr && body != nullptr) {
+                std::string freshKey = makeInstantiationKey(formula, "__fresh__", "forallL");
+                if (usedInstantiations.find(freshKey) != usedInstantiations.end()) {
+                    continue;
+                }
+
+                std::string c = freshConstant();
+
+                std::vector<const Formula*> newLeft = sequent.getLeft();
+                newLeft.erase(newLeft.begin() + static_cast<long long>(i));
+                std::vector<const Formula*> newRight = sequent.getRight();
+
+                Sequent next = sequent;
+                next.setLeft(newLeft);
+                next.setRight(newRight);
+                next.addOwnedLeft(body->substitute(*var, c));
+
+                std::set<std::string> nextUsed = usedInstantiations;
+                nextUsed.insert(freshKey);
+
+                trace.push_back("Apply ∀L - fresh term " + c);
+
+                std::set<std::string> nextVisited = visited;
+                return proveSequent(next, steps, branches, nextUsed, trace, nextVisited);
+            }
+        }
+    }
+
+    for (std::size_t i = 0; i < sequent.getRight().size(); ++i) {
+        const Formula* formula = sequent.getRight()[i];
+
+        if (formula != nullptr && formula->getType() == FormulaType::Exists) {
+            const std::string* var = formula->getVariable();
+            const Formula* body = formula->getBody();
+
+            if (var != nullptr && body != nullptr) {
+                std::string freshKey = makeInstantiationKey(formula, "__fresh__", "existsR");
+                if (usedInstantiations.find(freshKey) != usedInstantiations.end()) {
+                    continue;
+                }
+
+                std::string c = freshConstant();
+
+                std::vector<const Formula*> newLeft = sequent.getLeft();
+                std::vector<const Formula*> newRight = sequent.getRight();
+                newRight.erase(newRight.begin() + static_cast<long long>(i));
+
+                Sequent next = sequent;
+                next.setLeft(newLeft);
+                next.setRight(newRight);
+                next.addOwnedRight(body->substitute(*var, c));
+
+                std::set<std::string> nextUsed = usedInstantiations;
+                nextUsed.insert(freshKey);
+
+                trace.push_back("Apply ∃R - fresh term " + c);
+
+                std::set<std::string> nextVisited = visited;
+                return proveSequent(next, steps, branches, nextUsed, trace, nextVisited);
+            }
+        }
+    }
+
+    return false;
+}
+
+std::string BaselineProver::getName() const {
+    return "BaselineProver";
+}
+
+ProofResult BaselineProver::prove(ProofState& state) {
+    auto start = std::chrono::high_resolution_clock::now();
+
+    const Formula& formula = state.getFormula();
+    Sequent sequent({}, { &formula });
+
+    long long steps = 0;
+    long long branches = 1;
+    std::set<std::string> usedInstantiations;
+
+    std::vector<std::string> trace;
+    std::set<std::string> visited;
+
+    bool proved = proveSequent(sequent, steps, branches, usedInstantiations, trace, visited);
+
+    std::string message = proved
+        ? "Baseline: proved with current Algorithm 2 rule subset"
+        : "Baseline: failed with current branching + non-branching rule subset";
+
+    state.incrementSteps(steps);
+    state.incrementBranches(branches);
+
+    auto end = std::chrono::high_resolution_clock::now();
+    double runtimeMs =
+        std::chrono::duration<double, std::milli>(end - start).count();
+
+    // TEMP debug output
+    for (const auto& line : trace) {
+        std::cout << line << "\n";
+    }
+
+    return ProofResult(proved, steps, branches, runtimeMs, message, trace);
+}
